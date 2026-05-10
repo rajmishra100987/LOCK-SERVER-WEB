@@ -1,6 +1,5 @@
 // ==================== RAJ MISHRA ULTIMATE GUARD BOT ====================
-// SINGLE COOKIE | NO AUTO REFRESH | ALL MEMBERS PROTECTION
-// MQTT BASED | FILE BASED | PORT 4000
+// FINAL VERSION | 24/7 | AUTO RECONNECT | ONLY ON-CHANGE PROTECTION
 
 const fs = require('fs');
 const path = require('path');
@@ -9,12 +8,14 @@ const api = require('fca-mafiya');
 
 // ==================== CONFIG ====================
 const PORT = 4000;
-const REVERT_DELAY_MIN = 2000;  // 2 second min
-const REVERT_DELAY_MAX = 5000;  // 5 second max
+const REVERT_DELAY_MIN = 2000;
+const REVERT_DELAY_MAX = 5000;
 const MAX_LOGS = 30;
-const NICKNAME_SET_DELAY = 1000; // 1 second gap (SAFE)
-const HEALTH_CHECK_INTERVAL = 60000; // 1 minute
+const NICKNAME_SET_DELAY = 1000;
+const HEALTH_CHECK_INTERVAL = 60000;
 const MEMORY_LIMIT_MB = 500;
+const MQTT_RECONNECT_DELAY = 5000;
+const MAX_MQTT_RECONNECT = 20;
 
 // ==================== DATA DIR ====================
 const DATA_DIR = path.join(__dirname, 'data');
@@ -24,7 +25,6 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 let activeApi = null;
 let logs = [];
 let healthInterval = null;
-let isReconnecting = false;
 
 // ==================== LOG FUNCTION ====================
 function addLog(message, type = 'info') {
@@ -43,16 +43,15 @@ function readCookies() {
         return null;
     }
     const content = fs.readFileSync(cookiesPath, 'utf8');
-    // Sirf pehli valid cookie lega
     const lines = content.split('\n');
     for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.length > 0 && !trimmed.startsWith('//') && trimmed.includes('c_user')) {
-            addLog('✅ Cookie loaded successfully', 'success');
+            addLog('✅ Cookie loaded', 'success');
             return trimmed;
         }
     }
-    addLog('❌ No valid cookie found in cookies.txt', 'error');
+    addLog('❌ No valid cookie found', 'error');
     return null;
 }
 
@@ -77,19 +76,17 @@ function readDefaultNickname() {
     return fs.readFileSync(nickPath, 'utf8').trim();
 }
 
-// ==================== SAFE COOKIE PARSER ====================
-class SafeCookieParser {
+// ==================== COOKIE PARSER ====================
+class CookieParser {
     static parse(rawCookie) {
         if (!rawCookie || typeof rawCookie !== 'string') return null;
         
         try {
-            // Try JSON format first
             if (rawCookie.trim().startsWith('{') || rawCookie.trim().startsWith('[')) {
                 const parsed = JSON.parse(rawCookie);
                 return Array.isArray(parsed) ? parsed : [parsed];
             }
             
-            // Try cookie string format
             const cookies = [];
             const pairs = rawCookie.split(';');
             
@@ -107,12 +104,11 @@ class SafeCookieParser {
                 }
             }
             
-            // Validate essential cookies
             const hasCUser = cookies.some(c => c.key === 'c_user');
             const hasDatr = cookies.some(c => c.key === 'datr');
             
             if (!hasCUser || !hasDatr) {
-                addLog('⚠️ Cookie missing essential fields (c_user or datr)', 'warn');
+                addLog('⚠️ Cookie missing c_user or datr', 'warn');
                 return null;
             }
             
@@ -158,7 +154,87 @@ class RateLimiter {
     }
 }
 
-// ==================== SESSION MANAGER (SINGLE COOKIE ONLY) ====================
+// ==================== MQTT MANAGER WITH AUTO RECONNECT ====================
+class MQTTManager {
+    constructor(apiInstance, onEvent) {
+        this.api = apiInstance;
+        this.onEvent = onEvent;
+        this.isListening = false;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = MAX_MQTT_RECONNECT;
+        this.reconnectDelay = MQTT_RECONNECT_DELAY;
+        this.listenFunction = null;
+    }
+    
+    start() {
+        if (this.isListening) return;
+        this.isListening = true;
+        this.reconnectAttempts = 0;
+        this.connect();
+    }
+    
+    connect() {
+        if (!this.api) {
+            addLog('❌ No API for MQTT', 'error');
+            setTimeout(() => this.reconnect(), 10000);
+            return;
+        }
+        
+        addLog(`🔌 MQTT connecting...`, 'info');
+        
+        try {
+            this.listenFunction = this.api.listenMqtt(async (err, event) => {
+                if (err) {
+                    addLog(`⚠️ MQTT error: ${err.message || err}`, 'error');
+                    this.handleDisconnect();
+                    return;
+                }
+                
+                if (this.reconnectAttempts > 0) {
+                    addLog('✅ MQTT reconnected!', 'success');
+                    this.reconnectAttempts = 0;
+                }
+                
+                if (this.onEvent && !err) {
+                    await this.onEvent(event);
+                }
+            });
+            
+            addLog('👂 MQTT listener active', 'success');
+        } catch (e) {
+            addLog(`❌ MQTT error: ${e.message}`, 'error');
+            this.handleDisconnect();
+        }
+    }
+    
+    handleDisconnect() {
+        if (!this.isListening) return;
+        
+        this.reconnectAttempts++;
+        
+        if (this.reconnectAttempts > this.maxReconnectAttempts) {
+            addLog('❌ Max MQTT reconnect attempts reached', 'error');
+            this.isListening = false;
+            return;
+        }
+        
+        let delay = this.reconnectDelay * Math.min(this.reconnectAttempts, 5);
+        addLog(`🔄 MQTT reconnect in ${delay/1000}s (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
+        
+        setTimeout(() => {
+            this.connect();
+        }, delay);
+    }
+    
+    stop() {
+        this.isListening = false;
+        if (this.listenFunction) {
+            try { this.listenFunction.stop(); } catch(e) {}
+        }
+    }
+}
+
+// ==================== SESSION MANAGER ====================
 class SessionManager {
     constructor() {
         this.cookie = null;
@@ -183,10 +259,10 @@ class SessionManager {
         }
         
         this.isLoggingIn = true;
-        addLog(`🔐 Logging in... (Attempt ${retryCount + 1}/5)`, 'info');
+        addLog(`🔐 Logging in... (${retryCount + 1}/5)`, 'info');
         
         return new Promise((resolve) => {
-            const formattedCookies = SafeCookieParser.parse(this.cookie);
+            const formattedCookies = CookieParser.parse(this.cookie);
             if (!formattedCookies) {
                 addLog('❌ Invalid cookie format', 'error');
                 this.isLoggingIn = false;
@@ -195,7 +271,7 @@ class SessionManager {
             }
             
             const timeout = setTimeout(() => {
-                addLog('⏰ Login timeout (30s)', 'error');
+                addLog('⏰ Login timeout', 'error');
                 this.isLoggingIn = false;
                 resolve(false);
             }, 30000);
@@ -211,22 +287,17 @@ class SessionManager {
                 if (err) {
                     addLog(`❌ Login failed: ${err.error || err}`, 'error');
                     this.isLoggingIn = false;
-                    
-                    if (retryCount < 5) {
-                        setTimeout(() => {
-                            this.login(retryCount + 1).then(resolve);
-                        }, 10000);
-                    } else {
-                        resolve(false);
-                    }
-                } else if (apiInstance && apiInstance.getCurrentUserID()) {
+                    setTimeout(() => {
+                        this.login(retryCount + 1).then(resolve);
+                    }, 10000);
+                } else if (apiInstance) {
                     this.api = apiInstance;
                     activeApi = apiInstance;
                     this.isLoggingIn = false;
-                    addLog(`✅ Login successful! User ID: ${apiInstance.getCurrentUserID()}`, 'success');
+                    addLog(`✅ Login successful!`, 'success');
                     resolve(true);
                 } else {
-                    addLog('❌ Login returned invalid API instance', 'error');
+                    addLog('❌ Login returned invalid API', 'error');
                     this.isLoggingIn = false;
                     resolve(false);
                 }
@@ -236,21 +307,6 @@ class SessionManager {
     
     getApi() {
         return this.api;
-    }
-    
-    isSessionAlive() {
-        return new Promise((resolve) => {
-            if (!this.api) {
-                resolve(false);
-                return;
-            }
-            
-            const timeout = setTimeout(() => resolve(false), 10000);
-            this.api.getUserInfo(this.api.getCurrentUserID(), (err) => {
-                clearTimeout(timeout);
-                resolve(!err);
-            });
-        });
     }
 }
 
@@ -269,12 +325,11 @@ class GuardBot {
             nameReverts: 0,
             nickReverts: 0,
             membersSet: 0,
-            startTime: Date.now(),
-            lastHealthCheck: Date.now()
+            startTime: Date.now()
         };
-        this.processedEvents = new Set();
         this.memberCache = new Map();
         this.isSettingNicknames = false;
+        this.mqttManager = null;
     }
     
     loadConfig() {
@@ -283,7 +338,7 @@ class GuardBot {
         this.config.defaultNickname = readDefaultNickname();
         
         if (!this.config.threadID) {
-            addLog('❌ convo.txt missing - Cannot start', 'error');
+            addLog('❌ convo.txt missing', 'error');
             return false;
         }
         
@@ -293,8 +348,6 @@ class GuardBot {
         }
         if (this.config.defaultNickname) {
             addLog(`📋 Default Nickname: ${this.config.defaultNickname}`, 'info');
-        } else {
-            addLog(`⚠️ defaultnickname.txt missing - Nickname protection disabled`, 'warn');
         }
         
         return true;
@@ -311,14 +364,14 @@ class GuardBot {
                 clearTimeout(timeout);
                 
                 if (err || !info || !info.participantIDs) {
-                    addLog(`❌ Could not get member list: ${err}`, 'error');
+                    addLog(`❌ Could not get members: ${err}`, 'error');
                     resolve([]);
                     return;
                 }
                 
                 const botId = apiInstance.getCurrentUserID();
                 const members = info.participantIDs.filter(id => id !== botId);
-                addLog(`👥 Found ${members.length} members in group`, 'info');
+                addLog(`👥 Found ${members.length} members`, 'info');
                 resolve(members);
             });
         });
@@ -329,13 +382,10 @@ class GuardBot {
         if (userID === apiInstance.getCurrentUserID()) return false;
         
         return new Promise((resolve) => {
-            const timeout = setTimeout(() => {
-                resolve(false);
-            }, 10000);
+            const timeout = setTimeout(() => resolve(false), 10000);
             
             apiInstance.changeNickname(nickname, this.config.threadID, userID, (err) => {
                 clearTimeout(timeout);
-                
                 if (!err) {
                     this.memberCache.set(userID, nickname);
                     resolve(true);
@@ -348,10 +398,7 @@ class GuardBot {
     
     async setAllMembersNickname(apiInstance) {
         if (!this.config.defaultNickname) return 0;
-        if (this.isSettingNicknames) {
-            addLog('⚠️ Already setting nicknames, skipping...', 'warn');
-            return 0;
-        }
+        if (this.isSettingNicknames) return 0;
         
         this.isSettingNicknames = true;
         
@@ -364,37 +411,28 @@ class GuardBot {
         let successCount = 0;
         let failCount = 0;
         
-        const estimatedTime = Math.ceil(members.length * NICKNAME_SET_DELAY / 1000);
-        addLog(`🔄 Setting nicknames for ${members.length} members (~${estimatedTime} seconds)...`, 'info');
+        addLog(`🔄 Setting nicknames for ${members.length} members...`, 'info');
         
         for (let i = 0; i < members.length; i++) {
             const userID = members[i];
             const cachedNick = this.memberCache.get(userID);
             
-            if (cachedNick === this.config.defaultNickname) {
-                continue;
-            }
+            if (cachedNick === this.config.defaultNickname) continue;
             
             const success = await this.setMemberNickname(apiInstance, userID, this.config.defaultNickname);
+            if (success) successCount++;
+            else failCount++;
             
-            if (success) {
-                successCount++;
-            } else {
-                failCount++;
+            if ((i + 1) % 10 === 0) {
+                addLog(`📝 Progress: ${i+1}/${members.length}`, 'info');
             }
             
-            if ((i + 1) % 10 === 0 || i === members.length - 1) {
-                addLog(`📝 Progress: ${i+1}/${members.length} (${successCount} set, ${failCount} failed)`, 'info');
-            }
-            
-            // Delay between requests
             await new Promise(r => setTimeout(r, NICKNAME_SET_DELAY));
         }
         
         addLog(`✅ Nicknames: ${successCount} set, ${failCount} failed`, 'success');
         this.stats.membersSet = successCount;
         this.isSettingNicknames = false;
-        
         return successCount;
     }
     
@@ -402,23 +440,20 @@ class GuardBot {
         const apiInstance = sessionManager.getApi();
         if (!apiInstance) return false;
         
-        // Set group name
         if (this.config.targetGroupName) {
-            addLog(`🏷️ Setting initial group name...`, 'info');
+            addLog(`🏷️ Setting group name...`, 'info');
             await new Promise((resolve) => {
                 const timeout = setTimeout(() => resolve(), 10000);
                 apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
                     clearTimeout(timeout);
                     if (!err) addLog('✅ Group name set', 'success');
-                    else addLog(`⚠️ Could not set group name`, 'warn');
                     resolve();
                 });
             });
         }
         
-        // Set all members nicknames
         if (this.config.defaultNickname) {
-            addLog(`🏷️ Setting nicknames for ALL members...`, 'info');
+            addLog(`🏷️ Setting nicknames for ALL members (ONCE AT START)...`, 'info');
             await this.setAllMembersNickname(apiInstance);
         }
         
@@ -428,17 +463,13 @@ class GuardBot {
     async protectNickname(apiInstance, changedUserID, newNickname) {
         if (!this.config.defaultNickname) return false;
         if (changedUserID === apiInstance.getCurrentUserID()) return false;
-        
-        // Skip if already correct
         if (newNickname === this.config.defaultNickname) return false;
         
-        // Check cache
         const cachedNick = this.memberCache.get(changedUserID);
         if (cachedNick === this.config.defaultNickname) return false;
         
-        addLog(`⚠️ Nickname change detected for user ${changedUserID} -> "${newNickname}"`, 'warn');
+        addLog(`⚠️ Nickname changed for ${changedUserID} -> "${newNickname}"`, 'warn');
         
-        // Random delay before revert
         const delay = Math.floor(Math.random() * (REVERT_DELAY_MAX - REVERT_DELAY_MIN + 1) + REVERT_DELAY_MIN);
         
         return new Promise((resolve) => {
@@ -446,7 +477,7 @@ class GuardBot {
                 const success = await this.setMemberNickname(apiInstance, changedUserID, this.config.defaultNickname);
                 if (success) {
                     this.stats.nickReverts++;
-                    addLog(`✅ Nickname reverted for user ${changedUserID}`, 'success');
+                    addLog(`✅ Nickname reverted to "${this.config.defaultNickname}"`, 'success');
                     resolve(true);
                 } else {
                     addLog(`❌ Failed to revert nickname`, 'error');
@@ -458,154 +489,100 @@ class GuardBot {
     
     startGuard() {
         const apiInstance = sessionManager.getApi();
-        if (!apiInstance) {
-            addLog('❌ Cannot start guard - no API instance', 'error');
-            return false;
-        }
+        if (!apiInstance) return false;
         
-        // Periodic nickname sync (every hour)
-        setInterval(async () => {
-            if (this.config.defaultNickname && !this.isSettingNicknames && this.config.running) {
-                addLog('🔄 Periodic nickname sync...', 'info');
-                await this.setAllMembersNickname(apiInstance);
-            }
-        }, 60 * 60 * 1000);
+        // NO PERIODIC SYNC - Sirf tab kaam karega jab koi change karega
         
-        // Session health check (every 30 minutes)
-        setInterval(async () => {
-            const isAlive = await sessionManager.isSessionAlive();
-            if (!isAlive && this.config.running) {
-                addLog('⚠️ Session may be dead, but continuing...', 'warn');
-            }
-        }, 30 * 60 * 1000);
-        
-        // MQTT Listener
-        try {
-            apiInstance.listenMqtt(async (err, event) => {
-                if (err) {
-                    addLog(`⚠️ MQTT Error: ${err.message || err}`, 'error');
-                    return;
-                }
-                
-                if (!this.config.running) return;
-                if (event.threadID && event.threadID !== this.config.threadID) return;
-                
-                // Handle group name change
-                if (event.type === "event" && event.logMessageType === "log:thread-name") {
-                    const newName = event.logMessageData?.name;
-                    if (this.config.targetGroupName && newName && newName !== this.config.targetGroupName) {
-                        addLog(`⚠️ Group name changed to "${newName}" - Reverting`, 'warn');
-                        
-                        setTimeout(() => {
-                            apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
-                                if (!err) {
-                                    this.stats.nameReverts++;
-                                    addLog(`✅ Group name reverted`, 'success');
-                                }
-                            });
-                        }, Math.random() * 3000 + 1000);
-                    }
-                }
-                
-                // Handle nickname change
-                if (event.type === "event" && event.logMessageType === "log:user-nickname") {
-                    const changedUserID = event.logMessageData?.participant_id;
-                    const newNickname = event.logMessageData?.nickname;
-                    
-                    if (changedUserID && newNickname) {
-                        await this.protectNickname(apiInstance, changedUserID, newNickname);
-                    }
-                }
-                
-                // Handle new members
-                if (event.type === "event" && event.logMessageType === "log:subscribe") {
-                    const newMembers = event.logMessageData?.addedParticipants || [];
-                    
-                    for (const member of newMembers) {
-                        if (member.userId && this.config.defaultNickname) {
-                            setTimeout(async () => {
-                                await this.setMemberNickname(apiInstance, member.userId, this.config.defaultNickname);
-                                addLog(`✅ Nickname set for new member`, 'success');
-                            }, 2000);
-                        }
-                    }
-                }
-            });
+        // Setup MQTT with auto reconnect
+        this.mqttManager = new MQTTManager(apiInstance, async (event) => {
+            if (!this.config.running) return;
+            if (event.threadID && event.threadID !== this.config.threadID) return;
             
-            addLog('👂 MQTT Listener active', 'success');
-            return true;
-        } catch (e) {
-            addLog(`❌ Failed to start MQTT: ${e.message}`, 'error');
-            return false;
-        }
+            // Group name change protect
+            if (event.type === "event" && event.logMessageType === "log:thread-name") {
+                const newName = event.logMessageData?.name;
+                if (this.config.targetGroupName && newName && newName !== this.config.targetGroupName) {
+                    addLog(`⚠️ Group name changed to "${newName}" - Reverting`, 'warn');
+                    setTimeout(() => {
+                        apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
+                            if (!err) {
+                                this.stats.nameReverts++;
+                                addLog(`✅ Group name reverted to "${this.config.targetGroupName}"`, 'success');
+                            }
+                        });
+                    }, Math.random() * 3000 + 1000);
+                }
+            }
+            
+            // Nickname change protect - Sirf tab jab KOI CHANGE KARE
+            if (event.type === "event" && event.logMessageType === "log:user-nickname") {
+                const changedUserID = event.logMessageData?.participant_id;
+                const newNickname = event.logMessageData?.nickname;
+                if (changedUserID && newNickname) {
+                    await this.protectNickname(apiInstance, changedUserID, newNickname);
+                }
+            }
+            
+            // New member join - Auto set nickname
+            if (event.type === "event" && event.logMessageType === "log:subscribe") {
+                const newMembers = event.logMessageData?.addedParticipants || [];
+                for (const member of newMembers) {
+                    if (member.userId && this.config.defaultNickname) {
+                        setTimeout(async () => {
+                            await this.setMemberNickname(apiInstance, member.userId, this.config.defaultNickname);
+                            addLog(`✅ Nickname set for new member`, 'success');
+                        }, 2000);
+                    }
+                }
+            }
+        });
+        
+        this.mqttManager.start();
+        addLog('🛡️ Guard active - Protecting on changes only', 'success');
+        return true;
     }
     
     startHealthCheck() {
         healthInterval = setInterval(() => {
-            const now = Date.now();
-            const uptime = (now - this.stats.startTime) / 1000;
             const usedMemory = process.memoryUsage().heapUsed / 1024 / 1024;
             
-            this.stats.lastHealthCheck = now;
-            
-            // Memory limit check
             if (usedMemory > MEMORY_LIMIT_MB) {
-                addLog(`⚠️ Memory high: ${usedMemory.toFixed(1)}MB - Cleaning cache`, 'warn');
-                
-                // Clear processed events
-                if (this.processedEvents.size > 1000) {
-                    this.processedEvents.clear();
-                }
-                
-                // Clean member cache if too large
+                addLog(`⚠️ Memory: ${usedMemory.toFixed(1)}MB - Cleaning`, 'warn');
                 if (this.memberCache.size > 500) {
-                    const toDelete = Array.from(this.memberCache.keys()).slice(0, 100);
-                    toDelete.forEach(key => this.memberCache.delete(key));
+                    const keys = Array.from(this.memberCache.keys());
+                    for (let i = 0; i < 100; i++) {
+                        this.memberCache.delete(keys[i]);
+                    }
                 }
-                
                 if (global.gc) global.gc();
             }
-            
-            // Periodic stats
-            if (Math.floor(uptime) % 3600 === 0 && uptime > 0) {
-                addLog(`📊 Uptime: ${Math.floor(uptime / 3600)}h | Reverts: ${this.stats.nickReverts}`, 'info');
-            }
-            
         }, HEALTH_CHECK_INTERVAL);
     }
     
     async start() {
-        addLog('🚀 Starting RAJ MISHRA GUARD BOT...', 'info');
+        addLog('🚀 Starting Guard Bot...', 'info');
         
         if (!this.loadConfig()) return false;
         
         const loaded = await sessionManager.loadCookie();
-        if (!loaded) {
-            addLog('❌ No valid cookie found', 'error');
-            return false;
-        }
+        if (!loaded) return false;
         
         const loginSuccess = await sessionManager.login();
-        if (!loginSuccess) {
-            addLog('❌ Failed to login', 'error');
-            return false;
-        }
+        if (!loginSuccess) return false;
         
         await this.setInitialSettings();
         
         this.config.running = true;
         const guardStarted = this.startGuard();
         
-        if (!guardStarted) {
-            addLog('❌ Guard failed to start', 'error');
-            return false;
-        }
+        if (!guardStarted) return false;
         
         this.startHealthCheck();
         
         addLog('🛡️ RAJ MISHRA GUARD BOT STARTED!', 'success');
-        addLog('📊 ALL MEMBERS NICKNAME PROTECTION ACTIVE', 'success');
-        addLog('💡 NO AUTO REFRESH - Single cookie mode', 'info');
+        addLog('✅ Mode: Only revert when someone changes', 'success');
+        addLog('✅ Auto-Reconnect: ENABLED', 'success');
+        addLog('✅ 24/7 Ready: YES', 'success');
         
         return true;
     }
@@ -682,9 +659,6 @@ app.get('/', (req, res) => {
                     margin: 15px 0;
                 }
                 .stat-item { margin: 8px 0; font-family: monospace; font-size: 13px; }
-                .green { color: #00ff88; }
-                .cyan { color: #00ffff; }
-                .yellow { color: #ffaa00; }
                 .logs { max-height: 250px; overflow-y: auto; font-size: 11px; }
                 .footer { margin-top: 20px; font-size: 11px; color: #666; }
             </style>
@@ -708,24 +682,24 @@ app.get('/', (req, res) => {
                 <div class="stats">
                     <div class="stat-item">⚙️ CONFIGURATION</div>
                     <div class="stat-item">├─ Group Name Lock: ${stats.groupNameLocked ? '✅' : '❌'}</div>
-                    <div class="stat-item">├─ Nickname Lock: ${stats.nicknameLocked ? '✅ ACTIVE' : '❌'}</div>
-                    <div class="stat-item">└─ Auto Refresh: ❌ DISABLED</div>
+                    <div class="stat-item">├─ Nickname Lock: ${stats.nicknameLocked ? '✅' : '❌'}</div>
+                    <div class="stat-item">└─ Mode: Only on change</div>
                 </div>
                 
                 <div class="stats">
                     <div class="stat-item">⏱️ SYSTEM</div>
                     <div class="stat-item">├─ Uptime: ${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s</div>
-                    <div class="stat-item">├─ Single Cookie Mode: ✅</div>
-                    <div class="stat-item">└─ Last Login: First time only</div>
+                    <div class="stat-item">├─ Auto-Reconnect: ✅</div>
+                    <div class="stat-item">└─ 24/7 Ready: ✅</div>
                 </div>
                 
                 <div class="logs">
-                    <div class="stat-item">📝 RECENT LOGS (Last ${logs.length})</div>
+                    <div class="stat-item">📝 RECENT LOGS</div>
                     ${logsHtml || '<div>No logs yet</div>'}
                 </div>
                 
                 <div class="footer">
-                    🔒 SINGLE COOKIE MODE | NO AUTO REFRESH | ALL MEMBERS PROTECTION
+                    🔒 PROTECTS ONLY WHEN SOMEONE CHANGES | AUTO-RECONNECT | 24/7
                 </div>
             </div>
         </body>
@@ -737,10 +711,9 @@ app.get('/health', (req, res) => {
     const stats = guardBot.getStats();
     res.json({
         status: stats.running ? 'active' : 'inactive',
-        mode: 'single-cookie-no-refresh',
+        mode: 'on-change-only',
         uptime: stats.uptime,
-        threadID: stats.threadID,
-        reverts: { name: stats.nameReverts, nickname: stats.nickReverts },
+        reverts: stats.nickReverts,
         membersProtected: stats.membersInCache
     });
 });
@@ -754,25 +727,20 @@ function watchFiles() {
     files.forEach(file => {
         const filePath = path.join(__dirname, file);
         if (fs.existsSync(filePath)) {
-            if (watchers.has(file)) {
-                watchers.get(file).close();
-            }
+            if (watchers.has(file)) watchers.get(file).close();
             
             const watcher = fs.watch(filePath, () => {
                 addLog(`📝 ${file} changed - Reloading config`, 'info');
                 setTimeout(() => guardBot.loadConfig(), 1000);
             });
-            
             watchers.set(file, watcher);
         }
     });
-    
-    addLog('👁️ File watchers active', 'info');
 }
 
 // ==================== GRACEFUL SHUTDOWN ====================
 function gracefulShutdown() {
-    addLog('🛑 Shutting down gracefully...', 'warn');
+    addLog('🛑 Shutting down...', 'warn');
     
     if (healthInterval) clearInterval(healthInterval);
     
@@ -780,51 +748,44 @@ function gracefulShutdown() {
         try { watcher.close(); } catch(e) {}
     }
     
-    if (sessionManager.getApi()) {
-        try { 
-            addLog('👋 Logging out...', 'info');
-            sessionManager.getApi().logout(); 
-        } catch(e) {}
+    if (guardBot.mqttManager) {
+        guardBot.mqttManager.stop();
     }
     
-    setTimeout(() => {
-        addLog('👋 Goodbye!', 'info');
-        process.exit(0);
-    }, 2000);
+    if (sessionManager.getApi()) {
+        try { sessionManager.getApi().logout(); } catch(e) {}
+    }
+    
+    setTimeout(() => process.exit(0), 2000);
 }
 
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 process.on('uncaughtException', (error) => {
-    addLog(`🛡️ Uncaught Exception: ${error.message}`, 'error');
-    console.error(error.stack);
+    addLog(`Exception: ${error.message}`, 'error');
 });
 process.on('unhandledRejection', (reason) => {
-    addLog(`🛡️ Unhandled Rejection: ${reason}`, 'error');
+    addLog(`Rejection: ${reason}`, 'error');
 });
 
-// ==================== START SERVER ====================
+// ==================== START ====================
 const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log('\n' + '='.repeat(60));
-    console.log('🛡️ RAJ MISHRA ULTIMATE GUARD BOT');
+    console.log('🛡️ RAJ MISHRA ULTIMATE GUARD BOT - FINAL');
     console.log('='.repeat(60));
     console.log(`🌐 Web UI: http://localhost:${PORT}`);
     console.log(`💚 Health: http://localhost:${PORT}/health`);
     console.log('='.repeat(60));
     console.log('\n📁 REQUIRED FILES:');
-    console.log('   ✅ cookies.txt (required - Facebook cookie)');
-    console.log('   ✅ convo.txt (required - Group/Thread ID)');
-    console.log('   ⚠️ groupname.txt (optional - Group name to lock)');
-    console.log('   ⚠️ defaultnickname.txt (optional - Nickname for ALL members)');
-    console.log('\n🔒 MODE: SINGLE COOKIE - NO AUTO REFRESH');
-    console.log('   ✅ One time login only');
-    console.log('   ✅ Session lasts 60-90 days');
-    console.log('   ✅ No automatic re-login');
-    console.log('\n📊 PROTECTION FEATURES:');
-    console.log('   ✅ ALL members nickname protection');
-    console.log('   ✅ Auto memory cleanup');
-    console.log('   ✅ Rate limiting (1 second gap)');
-    console.log('   ✅ No crash guarantee');
+    console.log('   ✅ cookies.txt (Facebook cookie)');
+    console.log('   ✅ convo.txt (Group ID)');
+    console.log('   ⭕ groupname.txt (optional - Group name lock)');
+    console.log('   ⭕ defaultnickname.txt (optional - Nickname for ALL)');
+    console.log('\n🔒 HOW IT WORKS:');
+    console.log('   1. Start me: Sabka nickname set (ek baar)');
+    console.log('   2. Koi change karega: Turant revert');
+    console.log('   3. Koi change nahi karega: Bot idle');
+    console.log('   4. MQTT disconnect: Auto reconnect');
     console.log('='.repeat(60) + '\n');
     
     watchFiles();
@@ -832,11 +793,8 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     setTimeout(async () => {
         const started = await guardBot.start();
         if (!started) {
-            console.log('\n❌ FAILED TO START BOT!');
-            console.log('Please check:');
-            console.log('1. cookies.txt has a valid Facebook cookie');
-            console.log('2. convo.txt has correct group ID');
-            console.log('3. Internet connection is stable');
+            console.log('\n❌ FAILED TO START!');
+            console.log('Check cookies.txt and convo.txt');
             process.exit(1);
         }
     }, 2000);
