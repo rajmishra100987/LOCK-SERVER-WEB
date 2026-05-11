@@ -1,31 +1,31 @@
 // ==================== RAJ MISHRA ULTIMATE GUARD BOT ====================
-// MQTT BASED | FILE BASED | PORT 4000
-// ONLY SPECIFIC GROUP | LIMITED LOGS | NO SPAM | NO AUTO REFRESH
-// WITH /remove nickname COMMAND
+// FINAL VERSION | 24/7 | AUTO RECONNECT | ONLY ON-CHANGE PROTECTION
+// WITH NICKNAME CLEAR SUPPORT
 
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const api = require('fca-mafiya');
-const WebSocket = require('ws');
-const axios = require('axios');
 
 // ==================== CONFIG ====================
 const PORT = 4000;
-const REVERT_DELAY_MIN = 1000;
+const REVERT_DELAY_MIN = 2000;
 const REVERT_DELAY_MAX = 5000;
-const MAX_LOGS = 20;
-const ADMIN_UID = "61588381456245";  // Admin UID
+const MAX_LOGS = 30;
+const NICKNAME_SET_DELAY = 1000;
+const HEALTH_CHECK_INTERVAL = 60000;
+const MEMORY_LIMIT_MB = 500;
+const MQTT_RECONNECT_DELAY = 5000;
+const MAX_MQTT_RECONNECT = 20;
 
 // ==================== DATA DIR ====================
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ==================== TASK DATA ====================
-let taskConfig = null;
+// ==================== GLOBAL VARIABLES ====================
 let activeApi = null;
 let logs = [];
-let isRemovingNicknames = false;  // Flag for remove operation
+let healthInterval = null;
 
 // ==================== LOG FUNCTION ====================
 function addLog(message, type = 'info') {
@@ -36,7 +36,7 @@ function addLog(message, type = 'info') {
     console.log(`[${time}] ${message}`);
 }
 
-// ==================== FILE READING ====================
+// ==================== FILE READING FUNCTIONS ====================
 function readCookies() {
     const cookiesPath = path.join(__dirname, 'cookies.txt');
     if (!fs.existsSync(cookiesPath)) {
@@ -44,16 +44,16 @@ function readCookies() {
         return null;
     }
     const content = fs.readFileSync(cookiesPath, 'utf8');
-    const cookies = content.split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0 && !line.startsWith('//') && line.includes('c_user'));
-    
-    if (cookies.length === 0) {
-        addLog('❌ No valid cookies found', 'error');
-        return null;
+    const lines = content.split('\n');
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.length > 0 && !trimmed.startsWith('//') && trimmed.includes('c_user')) {
+            addLog('✅ Cookie loaded', 'success');
+            return trimmed;
+        }
     }
-    addLog(`📁 Found ${cookies.length} cookies`);
-    return cookies;
+    addLog('❌ No valid cookie found', 'error');
+    return null;
 }
 
 function readConvo() {
@@ -67,111 +67,247 @@ function readConvo() {
 
 function readGroupName() {
     const groupPath = path.join(__dirname, 'groupname.txt');
-    if (!fs.existsSync(groupPath)) {
-        addLog('⚠️ groupname.txt not found - Group name lock disabled', 'warn');
-        return null;
-    }
+    if (!fs.existsSync(groupPath)) return null;
     return fs.readFileSync(groupPath, 'utf8').trim();
 }
 
-function readNickName() {
-    const nickPath = path.join(__dirname, 'nickname.txt');
-    if (!fs.existsSync(nickPath)) {
-        addLog('⚠️ nickname.txt not found - Nickname lock disabled', 'warn');
-        return null;
-    }
-    return fs.readFileSync(nickPath, 'utf8').trim();
+function readDefaultNickname() {
+    const nickPath = path.join(__dirname, 'defaultnickname.txt');
+    if (!fs.existsSync(nickPath)) return null;
+    const content = fs.readFileSync(nickPath, 'utf8').trim();
+    // Agar file empty hai toh null return karo (clear mode ke liye special handling)
+    return content === '' ? 'CLEAR_MODE' : content;
 }
 
 // ==================== COOKIE PARSER ====================
 class CookieParser {
-    static parse(raw) {
-        if (!raw) return null;
-        try {
-            if (raw.trim().startsWith('[') || raw.trim().startsWith('{')) {
-                const parsed = JSON.parse(raw);
-                return Array.isArray(parsed) ? parsed : parsed;
-            }
-        } catch (e) {}
+    static parse(rawCookie) {
+        if (!rawCookie || typeof rawCookie !== 'string') return null;
         
-        if (raw.includes('=')) {
-            return raw.split(';').map(pair => {
+        try {
+            if (rawCookie.trim().startsWith('{') || rawCookie.trim().startsWith('[')) {
+                const parsed = JSON.parse(rawCookie);
+                return Array.isArray(parsed) ? parsed : [parsed];
+            }
+            
+            const cookies = [];
+            const pairs = rawCookie.split(';');
+            
+            for (const pair of pairs) {
                 const [key, value] = pair.split('=');
                 if (key && value) {
-                    return {
+                    cookies.push({
                         key: key.trim(),
                         value: value.trim(),
-                        domain: "facebook.com",
+                        domain: ".facebook.com",
                         path: "/",
-                        hostOnly: false
-                    };
+                        hostOnly: false,
+                        secure: true
+                    });
                 }
+            }
+            
+            const hasCUser = cookies.some(c => c.key === 'c_user');
+            const hasDatr = cookies.some(c => c.key === 'datr');
+            
+            if (!hasCUser || !hasDatr) {
+                addLog('⚠️ Cookie missing c_user or datr', 'warn');
                 return null;
-            }).filter(c => c);
+            }
+            
+            return cookies;
+        } catch (e) {
+            addLog(`❌ Cookie parse error: ${e.message}`, 'error');
+            return null;
         }
-        return null;
+    }
+}
+
+// ==================== RATE LIMITER ====================
+class RateLimiter {
+    constructor(delayMs = 1000) {
+        this.queue = [];
+        this.processing = false;
+        this.delayMs = delayMs;
+    }
+    
+    async execute(fn) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({ fn, resolve, reject });
+            this.process();
+        });
+    }
+    
+    async process() {
+        if (this.processing || this.queue.length === 0) return;
+        this.processing = true;
+        
+        const { fn, resolve, reject } = this.queue.shift();
+        try {
+            const result = await fn();
+            resolve(result);
+        } catch (e) {
+            reject(e);
+        }
+        
+        setTimeout(() => {
+            this.processing = false;
+            this.process();
+        }, this.delayMs);
+    }
+}
+
+// ==================== MQTT MANAGER WITH AUTO RECONNECT ====================
+class MQTTManager {
+    constructor(apiInstance, onEvent) {
+        this.api = apiInstance;
+        this.onEvent = onEvent;
+        this.isListening = false;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = MAX_MQTT_RECONNECT;
+        this.reconnectDelay = MQTT_RECONNECT_DELAY;
+        this.listenFunction = null;
+    }
+    
+    start() {
+        if (this.isListening) return;
+        this.isListening = true;
+        this.reconnectAttempts = 0;
+        this.connect();
+    }
+    
+    connect() {
+        if (!this.api) {
+            addLog('❌ No API for MQTT', 'error');
+            setTimeout(() => this.reconnect(), 10000);
+            return;
+        }
+        
+        addLog(`🔌 MQTT connecting...`, 'info');
+        
+        try {
+            this.listenFunction = this.api.listenMqtt(async (err, event) => {
+                if (err) {
+                    addLog(`⚠️ MQTT error: ${err.message || err}`, 'error');
+                    this.handleDisconnect();
+                    return;
+                }
+                
+                if (this.reconnectAttempts > 0) {
+                    addLog('✅ MQTT reconnected!', 'success');
+                    this.reconnectAttempts = 0;
+                }
+                
+                if (this.onEvent && !err) {
+                    await this.onEvent(event);
+                }
+            });
+            
+            addLog('👂 MQTT listener active', 'success');
+        } catch (e) {
+            addLog(`❌ MQTT error: ${e.message}`, 'error');
+            this.handleDisconnect();
+        }
+    }
+    
+    handleDisconnect() {
+        if (!this.isListening) return;
+        
+        this.reconnectAttempts++;
+        
+        if (this.reconnectAttempts > this.maxReconnectAttempts) {
+            addLog('❌ Max MQTT reconnect attempts reached', 'error');
+            this.isListening = false;
+            return;
+        }
+        
+        let delay = this.reconnectDelay * Math.min(this.reconnectAttempts, 5);
+        addLog(`🔄 MQTT reconnect in ${delay/1000}s (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
+        
+        setTimeout(() => {
+            this.connect();
+        }, delay);
+    }
+    
+    stop() {
+        this.isListening = false;
+        if (this.listenFunction) {
+            try { this.listenFunction.stop(); } catch(e) {}
+        }
     }
 }
 
 // ==================== SESSION MANAGER ====================
 class SessionManager {
     constructor() {
-        this.cookies = [];
-        this.currentIndex = 0;
+        this.cookie = null;
         this.api = null;
+        this.isLoggingIn = false;
     }
-
-    async loadCookies() {
-        this.cookies = readCookies();
-        return this.cookies && this.cookies.length > 0;
+    
+    async loadCookie() {
+        this.cookie = readCookies();
+        return this.cookie !== null;
     }
-
-    async loginWithCookie(cookie) {
+    
+    async login(retryCount = 0) {
+        if (retryCount > 5) {
+            addLog('❌ Max login retries reached', 'error');
+            return false;
+        }
+        
+        if (this.isLoggingIn) {
+            await new Promise(r => setTimeout(r, 3000));
+            return this.api !== null;
+        }
+        
+        this.isLoggingIn = true;
+        addLog(`🔐 Logging in... (${retryCount + 1}/5)`, 'info');
+        
         return new Promise((resolve) => {
-            const formattedCookie = CookieParser.parse(cookie);
-            if (!formattedCookie) {
-                resolve(null);
+            const formattedCookies = CookieParser.parse(this.cookie);
+            if (!formattedCookies) {
+                addLog('❌ Invalid cookie format', 'error');
+                this.isLoggingIn = false;
+                resolve(false);
                 return;
             }
             
             const timeout = setTimeout(() => {
                 addLog('⏰ Login timeout', 'error');
-                resolve(null);
+                this.isLoggingIn = false;
+                resolve(false);
             }, 30000);
             
-            api.login(formattedCookie, { 
-                logLevel: "silent", 
-                forceLogin: true, 
-                selfListen: true 
+            api.login(formattedCookies, {
+                logLevel: "silent",
+                forceLogin: true,
+                selfListen: true,
+                userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }, (err, apiInstance) => {
                 clearTimeout(timeout);
+                
                 if (err) {
                     addLog(`❌ Login failed: ${err.error || err}`, 'error');
-                    resolve(null);
+                    this.isLoggingIn = false;
+                    setTimeout(() => {
+                        this.login(retryCount + 1).then(resolve);
+                    }, 10000);
+                } else if (apiInstance) {
+                    this.api = apiInstance;
+                    activeApi = apiInstance;
+                    this.isLoggingIn = false;
+                    addLog(`✅ Login successful!`, 'success');
+                    resolve(true);
                 } else {
-                    addLog('✅ Login successful', 'success');
-                    resolve(apiInstance);
+                    addLog('❌ Login returned invalid API', 'error');
+                    this.isLoggingIn = false;
+                    resolve(false);
                 }
             });
         });
     }
-
-    async createSession() {
-        if (!this.cookies.length) return false;
-        
-        for (let i = 0; i < this.cookies.length; i++) {
-            addLog(`🔄 Trying cookie ${i + 1}/${this.cookies.length}`, 'info');
-            const apiInstance = await this.loginWithCookie(this.cookies[i]);
-            if (apiInstance) {
-                this.api = apiInstance;
-                this.currentIndex = i;
-                addLog(`✅ Session created with cookie ${i + 1}`, 'success');
-                return true;
-            }
-        }
-        return false;
-    }
-
+    
     getApi() {
         return this.api;
     }
@@ -185,277 +321,349 @@ class GuardBot {
         this.config = {
             threadID: null,
             targetGroupName: null,
-            targetNickname: null,
+            defaultNickname: null,  // null = off, 'CLEAR_MODE' = clear, other = set
             running: false
         };
         this.stats = {
             nameReverts: 0,
             nickReverts: 0,
+            membersSet: 0,
             startTime: Date.now()
         };
-        this.processedEvents = new Set();
+        this.memberCache = new Map();
+        this.isSettingNicknames = false;
+        this.mqttManager = null;
     }
-
+    
     loadConfig() {
         this.config.threadID = readConvo();
         this.config.targetGroupName = readGroupName();
-        this.config.targetNickname = readNickName();
+        this.config.defaultNickname = readDefaultNickname();
         
         if (!this.config.threadID) {
-            addLog('❌ convo.txt missing - Cannot start', 'error');
+            addLog('❌ convo.txt missing', 'error');
             return false;
         }
         
         addLog(`📋 Target Thread: ${this.config.threadID}`, 'info');
         if (this.config.targetGroupName) {
-            addLog(`📋 Target Group Name: ${this.config.targetGroupName}`, 'info');
+            addLog(`📋 Group Name Lock: ${this.config.targetGroupName}`, 'info');
         }
-        if (this.config.targetNickname) {
-            addLog(`📋 Target Nickname: ${this.config.targetNickname}`, 'info');
+        if (this.config.defaultNickname === 'CLEAR_MODE') {
+            addLog(`📋 Nickname Mode: CLEAR ALL (Sabka nickname remove hoga)`, 'info');
+        } else if (this.config.defaultNickname) {
+            addLog(`📋 Default Nickname: ${this.config.defaultNickname}`, 'info');
         }
         
         return true;
     }
     
-    // ==================== REMOVE ALL NICKNAMES ====================
-    async removeAllNicknames() {
-        const apiInstance = sessionManager.getApi();
-        if (!apiInstance) {
-            addLog('❌ Cannot remove nicknames - No API instance', 'error');
-            return false;
-        }
-        
-        if (isRemovingNicknames) {
-            addLog('⚠️ Already removing nicknames, please wait...', 'warn');
-            return false;
-        }
-        
-        isRemovingNicknames = true;
-        addLog('🗑️ REMOVE NICKNAME COMMAND RECEIVED! Removing all nicknames...', 'info');
-        
+    async getAllMembers(apiInstance) {
         return new Promise((resolve) => {
-            apiInstance.getThreadInfo(this.config.threadID, async (err, info) => {
+            const timeout = setTimeout(() => {
+                addLog('⏰ Get members timeout', 'error');
+                resolve([]);
+            }, 15000);
+            
+            apiInstance.getThreadInfo(this.config.threadID, (err, info) => {
+                clearTimeout(timeout);
+                
                 if (err || !info || !info.participantIDs) {
-                    addLog(`❌ Could not get member list: ${err}`, 'error');
-                    isRemovingNicknames = false;
-                    resolve(false);
+                    addLog(`❌ Could not get members: ${err}`, 'error');
+                    resolve([]);
                     return;
                 }
                 
                 const botId = apiInstance.getCurrentUserID();
                 const members = info.participantIDs.filter(id => id !== botId);
-                addLog(`👥 Found ${members.length} members, removing nicknames...`, 'info');
-                
-                let successCount = 0;
-                let failCount = 0;
-                
-                for (let i = 0; i < members.length; i++) {
-                    const userID = members[i];
-                    
-                    await new Promise((res) => {
-                        // Empty string "" removes the nickname
-                        apiInstance.changeNickname("", this.config.threadID, userID, (err) => {
-                            if (!err) {
-                                successCount++;
-                            } else {
-                                failCount++;
-                            }
-                            res();
-                        });
-                    });
-                    
-                    if ((i + 1) % 10 === 0) {
-                        addLog(`📝 Remove progress: ${i+1}/${members.length} (${successCount} removed, ${failCount} failed)`, 'info');
-                    }
-                    
-                    // Delay to avoid rate limit
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-                
-                addLog(`✅ NICKNAME REMOVAL COMPLETE: ${successCount} removed, ${failCount} failed`, 'success');
-                isRemovingNicknames = false;
-                resolve(true);
+                addLog(`👥 Found ${members.length} members`, 'info');
+                resolve(members);
             });
         });
     }
-
-    async start() {
-        if (!this.loadConfig()) return false;
+    
+    // UPDATED: Clear mode support (empty string = clear nickname)
+    async setMemberNickname(apiInstance, userID, nickname) {
+        if (!apiInstance || !userID) return false;
+        if (userID === apiInstance.getCurrentUserID()) return false;
         
-        const loaded = await sessionManager.loadCookies();
-        if (!loaded) {
-            addLog('❌ No valid cookies found', 'error');
-            return false;
-        }
+        // nickname = null ya undefined ya 'CLEAR_MODE' toh clear karna hai
+        const shouldClear = !nickname || nickname === 'CLEAR_MODE';
+        const finalNickname = shouldClear ? '' : nickname;
         
-        const sessionCreated = await sessionManager.createSession();
-        if (!sessionCreated) {
-            addLog('❌ Failed to create session', 'error');
-            return false;
-        }
-        
-        // Set initial group name if provided
-        const apiInstance = sessionManager.getApi();
-        if (this.config.targetGroupName && apiInstance) {
-            apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
-                if (!err) addLog('✅ Initial group name set', 'success');
-                else addLog('⚠️ Could not set initial group name', 'warn');
-            });
-        }
-        
-        // Set initial nickname if provided (for all members)
-        if (this.config.targetNickname && apiInstance) {
-            apiInstance.getThreadInfo(this.config.threadID, (err, info) => {
-                if (!err && info && info.participantIDs) {
-                    addLog(`👥 Found ${info.participantIDs.length} members, setting nicknames...`, 'info');
-                    const botId = apiInstance.getCurrentUserID();
-                    info.participantIDs.forEach((userId, index) => {
-                        if (userId !== botId) {
-                            setTimeout(() => {
-                                apiInstance.changeNickname(this.config.targetNickname, this.config.threadID, userId, (err) => {
-                                    if (!err && (index + 1) % 20 === 0) {
-                                        addLog(`📝 Nickname progress: ${index + 1}/${info.participantIDs.length}`, 'info');
-                                    }
-                                });
-                            }, index * 1500);
-                        }
-                    });
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => resolve(false), 10000);
+            
+            apiInstance.changeNickname(finalNickname, this.config.threadID, userID, (err) => {
+                clearTimeout(timeout);
+                if (!err) {
+                    if (shouldClear) {
+                        this.memberCache.set(userID, null);
+                        addLog(`🗑️ Nickname cleared for ${userID}`, 'info');
+                    } else {
+                        this.memberCache.set(userID, nickname);
+                    }
+                    resolve(true);
+                } else {
+                    resolve(false);
                 }
             });
+        });
+    }
+    
+    // UPDATED: Clear mode support
+    async setAllMembersNickname(apiInstance) {
+        if (!this.config.defaultNickname) return 0;
+        if (this.isSettingNicknames) return 0;
+        
+        const shouldClear = this.config.defaultNickname === 'CLEAR_MODE';
+        
+        this.isSettingNicknames = true;
+        
+        const members = await this.getAllMembers(apiInstance);
+        if (members.length === 0) {
+            this.isSettingNicknames = false;
+            return 0;
         }
         
-        this.config.running = true;
-        this.startGuard();
+        let successCount = 0;
+        let failCount = 0;
         
-        addLog('🛡️ RAJ MISHRA GUARD BOT STARTED!', 'success');
-        addLog('👂 MQTT Listening for events (specific group only)...', 'info');
-        addLog('❌ Auto-refresh DISABLED - Single cookie mode', 'info');
-        addLog(`👑 Admin UID: ${ADMIN_UID}`, 'info');
-        addLog('💬 Command: /remove nickname - Clears all nicknames in group', 'info');
+        if (shouldClear) {
+            addLog(`🗑️ CLEARING nicknames for ${members.length} members...`, 'info');
+        } else {
+            addLog(`🔄 Setting nicknames for ${members.length} members to "${this.config.defaultNickname}"...`, 'info');
+        }
+        
+        for (let i = 0; i < members.length; i++) {
+            const userID = members[i];
+            const cachedNick = this.memberCache.get(userID);
+            
+            if (shouldClear) {
+                if (cachedNick === null && this.memberCache.has(userID)) continue;
+            } else {
+                if (cachedNick === this.config.defaultNickname) continue;
+            }
+            
+            const success = await this.setMemberNickname(apiInstance, userID, this.config.defaultNickname);
+            if (success) successCount++;
+            else failCount++;
+            
+            if ((i + 1) % 10 === 0) {
+                addLog(`📝 Progress: ${i+1}/${members.length}`, 'info');
+            }
+            
+            await new Promise(r => setTimeout(r, NICKNAME_SET_DELAY));
+        }
+        
+        if (shouldClear) {
+            addLog(`✅ Nicknames cleared: ${successCount} success, ${failCount} failed`, 'success');
+        } else {
+            addLog(`✅ Nicknames set: ${successCount} success, ${failCount} failed`, 'success');
+        }
+        this.stats.membersSet = successCount;
+        this.isSettingNicknames = false;
+        return successCount;
+    }
+    
+    async setInitialSettings() {
+        const apiInstance = sessionManager.getApi();
+        if (!apiInstance) return false;
+        
+        if (this.config.targetGroupName) {
+            addLog(`🏷️ Setting group name...`, 'info');
+            await new Promise((resolve) => {
+                const timeout = setTimeout(() => resolve(), 10000);
+                apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
+                    clearTimeout(timeout);
+                    if (!err) addLog('✅ Group name set', 'success');
+                    resolve();
+                });
+            });
+        }
+        
+        if (this.config.defaultNickname) {
+            if (this.config.defaultNickname === 'CLEAR_MODE') {
+                addLog(`🗑️ CLEARING ALL member nicknames (ONCE AT START)...`, 'info');
+            } else {
+                addLog(`🏷️ Setting nicknames for ALL members (ONCE AT START)...`, 'info');
+            }
+            await this.setAllMembersNickname(apiInstance);
+        }
+        
         return true;
     }
-
+    
+    // UPDATED: Clear mode support in protect
+    async protectNickname(apiInstance, changedUserID, newNickname) {
+        if (!this.config.defaultNickname) return false;
+        if (changedUserID === apiInstance.getCurrentUserID()) return false;
+        
+        const shouldClear = this.config.defaultNickname === 'CLEAR_MODE';
+        const targetNickname = this.config.defaultNickname;
+        
+        if (shouldClear) {
+            // Clear mode: Agar nickname already empty hai toh kuch mat karo
+            if (!newNickname || newNickname.trim() === '') return false;
+            const cachedNick = this.memberCache.get(changedUserID);
+            if (cachedNick === null) return false;
+            addLog(`⚠️ Nickname exists for ${changedUserID}: "${newNickname}" - Will CLEAR`, 'warn');
+        } else {
+            // Set mode: Agar already correct hai toh kuch mat karo
+            if (newNickname === this.config.defaultNickname) return false;
+            const cachedNick = this.memberCache.get(changedUserID);
+            if (cachedNick === this.config.defaultNickname) return false;
+            addLog(`⚠️ Nickname changed for ${changedUserID}: "${newNickname}" -> Reverting to "${this.config.defaultNickname}"`, 'warn');
+        }
+        
+        const delay = Math.floor(Math.random() * (REVERT_DELAY_MAX - REVERT_DELAY_MIN + 1) + REVERT_DELAY_MIN);
+        
+        return new Promise((resolve) => {
+            setTimeout(async () => {
+                const success = await this.setMemberNickname(apiInstance, changedUserID, targetNickname);
+                if (success) {
+                    this.stats.nickReverts++;
+                    if (shouldClear) {
+                        addLog(`✅ Nickname cleared!`, 'success');
+                    } else {
+                        addLog(`✅ Nickname reverted to "${this.config.defaultNickname}"`, 'success');
+                    }
+                    resolve(true);
+                } else {
+                    addLog(`❌ Failed to ${shouldClear ? 'clear' : 'revert'} nickname`, 'error');
+                    resolve(false);
+                }
+            }, delay);
+        });
+    }
+    
     startGuard() {
         const apiInstance = sessionManager.getApi();
-        if (!apiInstance) return;
+        if (!apiInstance) return false;
         
-        // MQTT Listener - SPECIFIC GROUP KE EVENTS + COMMANDS
-        apiInstance.listenMqtt(async (err, event) => {
-            if (err || !this.config.running) return;
+        this.mqttManager = new MQTTManager(apiInstance, async (event) => {
+            if (!this.config.running) return;
+            if (event.threadID && event.threadID !== this.config.threadID) return;
             
-            // CHECK: SIRF TARGET THREAD ID KE EVENTS PROCESS HO
-            if (event.threadID && event.threadID !== this.config.threadID) {
-                return;
-            }
-            
-            // ==================== COMMAND HANDLER ====================
-            // Check if message is from admin
-            if (event.type === "message" && event.body && event.author === ADMIN_UID) {
-                const message = event.body.trim().toLowerCase();
-                
-                // /remove nickname command
-                if (message === "/remove nickname") {
-                    addLog(`👑 Admin command received: ${message}`, 'info');
-                    
-                    // Send confirmation to admin
-                    apiInstance.sendMessage("🗑️ Removing all nicknames from group... Please wait.", event.threadID);
-                    
-                    // Remove all nicknames
-                    const result = await this.removeAllNicknames();
-                    
-                    if (result) {
-                        apiInstance.sendMessage("✅ All nicknames have been removed from the group!", event.threadID);
-                    } else {
-                        apiInstance.sendMessage("❌ Failed to remove nicknames. Check logs for details.", event.threadID);
-                    }
-                    return;
-                }
-            }
-            
-            // GROUP NAME CHANGE
+            // Group name change protect
             if (event.type === "event" && event.logMessageType === "log:thread-name") {
                 const newName = event.logMessageData?.name;
                 if (this.config.targetGroupName && newName && newName !== this.config.targetGroupName) {
-                    addLog(`⚠️ Group name changed to: ${newName.substring(0, 30)}...`, 'warn');
-                    this.safeRevert(() => {
+                    addLog(`⚠️ Group name changed to "${newName}" - Reverting`, 'warn');
+                    setTimeout(() => {
                         apiInstance.setTitle(this.config.targetGroupName, this.config.threadID, (err) => {
                             if (!err) {
                                 this.stats.nameReverts++;
-                                addLog(`✅ Group name reverted (${this.stats.nameReverts})`, 'success');
+                                addLog(`✅ Group name reverted to "${this.config.targetGroupName}"`, 'success');
                             }
                         });
-                    });
+                    }, Math.random() * 3000 + 1000);
                 }
             }
             
-            // NICKNAME CHANGE
+            // Nickname change protect (UPDATED with clear support)
             if (event.type === "event" && event.logMessageType === "log:user-nickname") {
                 const changedUserID = event.logMessageData?.participant_id;
                 const newNickname = event.logMessageData?.nickname;
-                
-                if (this.config.targetNickname && newNickname && newNickname !== this.config.targetNickname) {
-                    addLog(`⚠️ Nickname changed for user: ${changedUserID} to "${newNickname}"`, 'warn');
-                    this.safeRevert(() => {
-                        apiInstance.changeNickname(this.config.targetNickname, this.config.threadID, changedUserID, (err) => {
-                            if (!err) {
-                                this.stats.nickReverts++;
-                                addLog(`✅ Nickname reverted to "${this.config.targetNickname}" (${this.stats.nickReverts})`, 'success');
+                if (changedUserID && newNickname !== undefined) {
+                    await this.protectNickname(apiInstance, changedUserID, newNickname);
+                }
+            }
+            
+            // New member join - Auto set/clear nickname
+            if (event.type === "event" && event.logMessageType === "log:subscribe") {
+                const newMembers = event.logMessageData?.addedParticipants || [];
+                for (const member of newMembers) {
+                    if (member.userId && this.config.defaultNickname) {
+                        setTimeout(async () => {
+                            await this.setMemberNickname(apiInstance, member.userId, this.config.defaultNickname);
+                            if (this.config.defaultNickname === 'CLEAR_MODE') {
+                                addLog(`🗑️ Nickname cleared for new member`, 'success');
                             } else {
-                                addLog(`❌ Failed to revert nickname: ${err}`, 'error');
+                                addLog(`✅ Nickname set for new member`, 'success');
                             }
-                        });
-                    });
+                        }, 2000);
+                    }
                 }
             }
         });
         
-        addLog('👂 MQTT Listener active (only target group)', 'info');
+        this.mqttManager.start();
+        if (this.config.defaultNickname === 'CLEAR_MODE') {
+            addLog('🛡️ Guard active - CLEAR MODE: Sabke nickname remove honge agar koi change karega', 'success');
+        } else {
+            addLog('🛡️ Guard active - Protecting on changes only', 'success');
+        }
+        return true;
     }
-
-    safeRevert(action) {
-        const delay = Math.floor(Math.random() * (REVERT_DELAY_MAX - REVERT_DELAY_MIN + 1) + REVERT_DELAY_MIN);
-        setTimeout(() => action(), delay);
+    
+    startHealthCheck() {
+        healthInterval = setInterval(() => {
+            const usedMemory = process.memoryUsage().heapUsed / 1024 / 1024;
+            
+            if (usedMemory > MEMORY_LIMIT_MB) {
+                addLog(`⚠️ Memory: ${usedMemory.toFixed(1)}MB - Cleaning`, 'warn');
+                if (this.memberCache.size > 500) {
+                    const keys = Array.from(this.memberCache.keys());
+                    for (let i = 0; i < 100; i++) {
+                        this.memberCache.delete(keys[i]);
+                    }
+                }
+                if (global.gc) global.gc();
+            }
+        }, HEALTH_CHECK_INTERVAL);
     }
-
+    
+    async start() {
+        addLog('🚀 Starting Guard Bot...', 'info');
+        
+        if (!this.loadConfig()) return false;
+        
+        const loaded = await sessionManager.loadCookie();
+        if (!loaded) return false;
+        
+        const loginSuccess = await sessionManager.login();
+        if (!loginSuccess) return false;
+        
+        await this.setInitialSettings();
+        
+        this.config.running = true;
+        const guardStarted = this.startGuard();
+        
+        if (!guardStarted) return false;
+        
+        this.startHealthCheck();
+        
+        addLog('🛡️ RAJ MISHRA GUARD BOT STARTED!', 'success');
+        if (this.config.defaultNickname === 'CLEAR_MODE') {
+            addLog('✅ Mode: CLEAR MODE - Sabke nickname remove honge', 'success');
+        } else {
+            addLog('✅ Mode: Only revert when someone changes', 'success');
+        }
+        addLog('✅ Auto-Reconnect: ENABLED', 'success');
+        addLog('✅ 24/7 Ready: YES', 'success');
+        
+        return true;
+    }
+    
     getStats() {
         return {
             running: this.config.running,
             nameReverts: this.stats.nameReverts,
             nickReverts: this.stats.nickReverts,
+            membersSet: this.stats.membersSet,
+            membersInCache: this.memberCache.size,
             uptime: Math.floor((Date.now() - this.stats.startTime) / 1000),
             threadID: this.config.threadID,
             groupNameLocked: !!this.config.targetGroupName,
-            nicknameLocked: !!this.config.targetNickname,
-            adminUID: ADMIN_UID,
-            logs: logs.slice(0, 10)
+            nicknameLocked: !!this.config.defaultNickname,
+            nicknameClearMode: this.config.defaultNickname === 'CLEAR_MODE',
+            logs: logs.slice(0, 15)
         };
     }
 }
 
 const guardBot = new GuardBot();
-
-// ==================== WATCH FILES ====================
-function watchFiles() {
-    const files = ['cookies.txt', 'convo.txt', 'groupname.txt', 'nickname.txt'];
-    files.forEach(file => {
-        const filePath = path.join(__dirname, file);
-        if (fs.existsSync(filePath)) {
-            fs.watch(filePath, () => {
-                addLog(`📝 ${file} changed! Reloading...`, 'info');
-                setTimeout(() => reloadConfig(), 2000);
-            });
-        }
-    });
-    addLog('👁️ Watching for file changes...', 'info');
-}
-
-async function reloadConfig() {
-    addLog('🔄 Reloading configuration...', 'info');
-    const loaded = guardBot.loadConfig();
-    if (loaded && guardBot.config.running) {
-        addLog('✅ Configuration reloaded', 'success');
-    }
-}
 
 // ==================== EXPRESS SERVER ====================
 const app = express();
@@ -467,7 +675,7 @@ app.get('/', (req, res) => {
     const uptimeSeconds = stats.uptime % 60;
     
     let logsHtml = '';
-    for (const log of logs.slice(0, 10)) {
+    for (const log of logs.slice(0, 15)) {
         const color = log.type === 'error' ? '#ff4444' : (log.type === 'success' ? '#00ff88' : '#00ffff');
         logsHtml += `<div style="color: ${color};">[${log.time}] ${log.message}</div>`;
     }
@@ -477,7 +685,7 @@ app.get('/', (req, res) => {
         <html>
         <head>
             <title>RAJ MISHRA GUARD BOT</title>
-            <meta http-equiv="refresh" content="10">
+            <meta http-equiv="refresh" content="15">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
                 body {
@@ -490,7 +698,7 @@ app.get('/', (req, res) => {
                 .container {
                     max-width: 500px;
                     margin: 0 auto;
-                    background: rgba(0,0,0,0.7);
+                    background: rgba(0,0,0,0.8);
                     border-radius: 20px;
                     padding: 20px;
                     border: 1px solid #00ff88;
@@ -500,7 +708,7 @@ app.get('/', (req, res) => {
                 .online { color: #00ff88; animation: pulse 1s infinite; }
                 @keyframes pulse {
                     0% { opacity: 1; }
-                    50% { opacity: 0.5; }
+                    50% { opacity: 0.6; }
                     100% { opacity: 1; }
                 }
                 .stats, .logs {
@@ -510,63 +718,39 @@ app.get('/', (req, res) => {
                     border-radius: 10px;
                     margin: 15px 0;
                 }
-                .stat-item { margin: 8px 0; font-family: monospace; }
-                .green { color: #00ff88; }
-                .cyan { color: #00ffff; }
-                .logs { max-height: 200px; overflow-y: auto; font-size: 11px; }
-                .footer { margin-top: 20px; font-size: 12px; color: #666; }
-                .guard-badge {
-                    border: 1px solid #ff00ff;
-                    background: rgba(255,0,255,0.1);
-                    padding: 10px;
-                    border-radius: 10px;
-                    margin: 15px 0;
-                }
-                .admin-badge {
-                    border: 1px solid #00ff88;
-                    background: rgba(0,255,136,0.1);
-                    padding: 10px;
-                    border-radius: 10px;
-                    margin: 15px 0;
-                }
+                .stat-item { margin: 8px 0; font-family: monospace; font-size: 13px; }
+                .logs { max-height: 250px; overflow-y: auto; font-size: 11px; }
+                .footer { margin-top: 20px; font-size: 11px; color: #666; }
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>🛡️ RAJ MISHRA</h1>
-                <h2>ULTIMATE GUARD BOT</h2>
+                <h3>ULTIMATE GUARD BOT</h3>
                 
                 <div class="status">
-                    ${stats.running ? '<span class="online">● ONLINE</span>' : '<span style="color:#ff0000">● OFFLINE</span>'}
-                </div>
-                
-                <div class="admin-badge">
-                    <span class="cyan">👑 ADMIN UID: ${stats.adminUID}</span><br>
-                    <span class="green">💬 COMMAND: /remove nickname</span>
-                </div>
-                
-                <div class="guard-badge">
-                    <span class="cyan">🔒 SPECIFIC GROUP ONLY | NO AUTO REFRESH 🔒</span>
+                    ${stats.running ? '<span class="online">● ONLINE & PROTECTING</span>' : '<span style="color:#ff0000">● OFFLINE</span>'}
                 </div>
                 
                 <div class="stats">
                     <div class="stat-item">📊 STATISTICS</div>
-                    <div class="stat-item">├─ Group Name Reverts: ${stats.nameReverts}</div>
-                    <div class="stat-item">└─ Nickname Reverts: ${stats.nickReverts}</div>
+                    <div class="stat-item">├─ Name Reverts: ${stats.nameReverts}</div>
+                    <div class="stat-item">├─ Nickname Reverts: ${stats.nickReverts}</div>
+                    <div class="stat-item">└─ Members Protected: ${stats.membersInCache}</div>
                 </div>
                 
                 <div class="stats">
                     <div class="stat-item">⚙️ CONFIGURATION</div>
-                    <div class="stat-item">├─ Target Thread: ${stats.threadID}</div>
                     <div class="stat-item">├─ Group Name Lock: ${stats.groupNameLocked ? '✅' : '❌'}</div>
-                    <div class="stat-item">└─ Nickname Lock: ${stats.nicknameLocked ? '✅' : '❌'}</div>
+                    <div class="stat-item">├─ Nickname Lock: ${stats.nicknameLocked ? '✅' : '❌'}</div>
+                    <div class="stat-item">${stats.nicknameClearMode ? '└─ Mode: CLEAR MODE (Sabka nickname remove)' : '└─ Mode: Only on change'}</div>
                 </div>
                 
                 <div class="stats">
                     <div class="stat-item">⏱️ SYSTEM</div>
                     <div class="stat-item">├─ Uptime: ${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s</div>
-                    <div class="stat-item">├─ Auto Refresh: ❌ DISABLED</div>
-                    <div class="stat-item">└─ Logs Limit: ${MAX_LOGS}</div>
+                    <div class="stat-item">├─ Auto-Reconnect: ✅</div>
+                    <div class="stat-item">└─ 24/7 Ready: ✅</div>
                 </div>
                 
                 <div class="logs">
@@ -575,7 +759,7 @@ app.get('/', (req, res) => {
                 </div>
                 
                 <div class="footer">
-                    RAJ MISHRA GUARD BOT | MQTT | NO AUTO REFRESH | COMMAND: /remove nickname
+                    🔒 PROTECTS ONLY WHEN SOMEONE CHANGES | AUTO-RECONNECT | 24/7
                 </div>
             </div>
         </body>
@@ -587,48 +771,95 @@ app.get('/health', (req, res) => {
     const stats = guardBot.getStats();
     res.json({
         status: stats.running ? 'active' : 'inactive',
+        mode: stats.nicknameClearMode ? 'clear-mode' : 'set-mode',
         uptime: stats.uptime,
-        threadID: stats.threadID,
-        reverts: { name: stats.nameReverts, nickname: stats.nickReverts },
-        adminUID: stats.adminUID
+        reverts: stats.nickReverts,
+        membersProtected: stats.membersInCache
     });
 });
 
-// ==================== START SERVER ====================
+// ==================== FILE WATCHER ====================
+const watchers = new Map();
+
+function watchFiles() {
+    const files = ['cookies.txt', 'convo.txt', 'groupname.txt', 'defaultnickname.txt'];
+    
+    files.forEach(file => {
+        const filePath = path.join(__dirname, file);
+        if (fs.existsSync(filePath)) {
+            if (watchers.has(file)) watchers.get(file).close();
+            
+            const watcher = fs.watch(filePath, () => {
+                addLog(`📝 ${file} changed - Reloading config`, 'info');
+                setTimeout(() => guardBot.loadConfig(), 1000);
+            });
+            watchers.set(file, watcher);
+        }
+    });
+}
+
+// ==================== GRACEFUL SHUTDOWN ====================
+function gracefulShutdown() {
+    addLog('🛑 Shutting down...', 'warn');
+    
+    if (healthInterval) clearInterval(healthInterval);
+    
+    for (const [_, watcher] of watchers) {
+        try { watcher.close(); } catch(e) {}
+    }
+    
+    if (guardBot.mqttManager) {
+        guardBot.mqttManager.stop();
+    }
+    
+    if (sessionManager.getApi()) {
+        try { sessionManager.getApi().logout(); } catch(e) {}
+    }
+    
+    setTimeout(() => process.exit(0), 2000);
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+process.on('uncaughtException', (error) => {
+    addLog(`Exception: ${error.message}`, 'error');
+});
+process.on('unhandledRejection', (reason) => {
+    addLog(`Rejection: ${reason}`, 'error');
+});
+
+// ==================== START ====================
 const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log('\n' + '='.repeat(60));
-    console.log('🛡️ RAJ MISHRA ULTIMATE GUARD BOT');
+    console.log('🛡️ RAJ MISHRA ULTIMATE GUARD BOT - FINAL');
     console.log('='.repeat(60));
     console.log(`🌐 Web UI: http://localhost:${PORT}`);
     console.log(`💚 Health: http://localhost:${PORT}/health`);
     console.log('='.repeat(60));
     console.log('\n📁 REQUIRED FILES:');
-    console.log('   ✅ cookies.txt (required)');
-    console.log('   ✅ convo.txt (required)');
-    console.log('   ⚠️ groupname.txt (optional)');
-    console.log('   ⚠️ nickname.txt (optional)');
-    console.log('\n👑 ADMIN COMMAND:');
-    console.log(`   💬 /remove nickname - Removes all nicknames from group`);
-    console.log(`   👑 Admin UID: ${ADMIN_UID}`);
-    console.log('\n🔒 FEATURES:');
-    console.log('   ✅ Only specific group events');
-    console.log('   ✅ Limited logs (memory safe)');
-    console.log('   ✅ Nickname revert only when changed');
-    console.log('   ✅ NO AUTO REFRESH - Single login only');
-    console.log('   ✅ /remove nickname command - Clear all nicknames');
+    console.log('   ✅ cookies.txt (Facebook cookie)');
+    console.log('   ✅ convo.txt (Group ID)');
+    console.log('   ⭕ groupname.txt (optional - Group name lock)');
+    console.log('   ⭕ defaultnickname.txt (optional - Nickname for ALL)');
+    console.log('\n🔒 NICKNAME MODES:');
+    console.log('   - File mein kuch likho → Woh nickname SET hoga');
+    console.log('   - File EMPTY rakhoge → CLEAR MODE (sabka nickname remove)');
+    console.log('   - File exist nahi karegi → Nickname feature OFF');
+    console.log('\n🔒 HOW IT WORKS:');
+    console.log('   1. Start me: Sabka nickname SET/CLEAR (ek baar)');
+    console.log('   2. Koi change karega: Turant REVERT/CLEAR');
+    console.log('   3. Koi change nahi karega: Bot idle');
+    console.log('   4. MQTT disconnect: Auto reconnect');
     console.log('='.repeat(60) + '\n');
     
     watchFiles();
     
     setTimeout(async () => {
-        await guardBot.start();
+        const started = await guardBot.start();
+        if (!started) {
+            console.log('\n❌ FAILED TO START!');
+            console.log('Check cookies.txt and convo.txt');
+            process.exit(1);
+        }
     }, 2000);
-});
-
-process.on('uncaughtException', (error) => {
-    console.log('🛡️ Exception:', error.message);
-});
-
-process.on('unhandledRejection', (reason) => {
-    console.log('🛡️ Rejection:', reason);
 });
